@@ -1,7 +1,8 @@
 import numpy as np
 import tensorly as tl
 from matplotlib import pyplot as plt
-from tensorly.decomposition import parafac
+from tensorly.decomposition import parafac, tucker, non_negative_parafac, non_negative_tucker
+from tensorly.tenalg import mode_dot
 
 from src.utils.data_processing import predict_ignition_using_final_frames
 from src.utils.utils import load_cached_schlieren_images
@@ -11,83 +12,96 @@ from src.utils.paths import output_dir
 def main():
     run_to_image = load_cached_schlieren_images()
     im_shape = next(iter(run_to_image.values()))[0].shape
-
     ignition_status = predict_ignition_using_final_frames(run_to_image)
 
     # Construct the data tensor of shape (num_runs, num_features, num_time steps)
+    X = construct_data_tensor(run_to_image)
 
+    # Perform Tucker and N Tucker decompositions
+
+    for fn, name in [(tucker, "tucker"), (non_negative_tucker, "non-negative tucker")]:
+        core, factors = fn(X, rank=2)
+
+        run_factor = factors[0]
+        feature_factor = factors[1]
+        time_factor = factors[2]
+
+        # Reconstruct a trajectory in 2D for each run (26, 18)
+        trajectory_tensor = mode_dot(mode_dot(core, run_factor, mode=0), time_factor, mode=2)
+        trajectory_matrix_0 = trajectory_tensor[:, 0, :]
+        trajectory_matrix_1 = trajectory_tensor[:, 1, :]
+
+        visualise_principle_components(time_factor, run_factor, feature_factor, im_shape, name)
+        plot_trajectory(trajectory_matrix_0, trajectory_matrix_1, ignition_status, name)
+
+
+    # Perform CP and NCP decompositions
+
+    for fn, name in [(parafac, "cp"), (non_negative_parafac, "non-negative cp")]:
+        weights, factors = fn(X, rank=2)
+
+        print(f"Weights: {weights}")
+
+        run_factor = factors[0]  # (26, 2)
+        feature_factor = factors[1]  # (66,000, 2)
+        time_factor = factors[2]  # (18, 2)
+
+        # Reconstruct a trajectory in 2D for each run (26, 18)
+        trajectory_matrix_0 = np.outer(run_factor[:, 0], time_factor[:, 0])
+        trajectory_matrix_1 = np.outer(run_factor[:, 1], time_factor[:, 1])
+
+        visualise_principle_components(time_factor, run_factor, feature_factor, im_shape, name)
+        plot_trajectory(trajectory_matrix_0, trajectory_matrix_1, ignition_status, name)
+
+
+
+def construct_data_tensor(run_to_image):
     Xs = []
     for run, ims in run_to_image.items():
         Xs.append(np.stack([im.flatten() for im in ims], axis=0)[:18])
-
     X = np.stack(Xs, axis=0).swapaxes(1, 2)
     X = tl.tensor(X)
-
     print(f"X.shape = {X.shape}")
-
-    # Perform CP decomposition
-    weights, factors = parafac(X, rank=2)
-
-    run_factor = factors[0]  # (26, 2)
-    feature_factor = factors[1]  # (66,000, 2)
-    time_factor = factors[2]  # (18, 2)
-
-    # Reconstruct a trajectory in 2D for each run (26, 18)
-    trajectory_matrix_0 = np.outer(run_factor[:, 0], time_factor[:, 0])
-    trajectory_matrix_1 = np.outer(run_factor[:, 1], time_factor[:, 1])
-    trajectory_matrix_sum = trajectory_matrix_0 + trajectory_matrix_1
-
-    visualise_principle_components_time_and_trial(time_factor, run_factor)
-
-    visualise_principle_components_feature_space(feature_factor, im_shape)
-
-    plot_trajectory(trajectory_matrix_0, trajectory_matrix_1, ignition_status)
-
-    # Okay, so how do we reconstruct a trajectory for a new run (this would have shape (66000, 18)) ?
-    # Matrix mult with feature_factor.T?
+    return X
 
 
-def visualise_principle_components_time_and_trial(time_factor, run_factor):
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(2, 2, 1)
+def visualise_principle_components(time_factor, run_factor, feature_factor, im_shape, name):
+    fig = plt.figure(figsize=(12, 8))
+
+    ax = fig.add_subplot(2, 3, 1)
     ax.plot(time_factor[:, 0])
     ax.set_ylabel("First mode")
-    ax = fig.add_subplot(2, 2, 3)
+
+    ax = fig.add_subplot(2, 3, 4)
     ax.plot(time_factor[:, 1])
     ax.set_ylabel("Second mode")
     ax.set_xlabel("Time")
 
-    ax = fig.add_subplot(2, 2, 2)
+    ax = fig.add_subplot(2, 3, 2)
     ax.plot(run_factor[:, 0])
 
-    ax = fig.add_subplot(2, 2, 4)
+    ax = fig.add_subplot(2, 3, 5)
     ax.plot(run_factor[:, 1])
     ax.set_xlabel("Run")
 
-    fig.suptitle("Canonical polyadic decomposition time and run modes")
-    fig.tight_layout()
-    fig.savefig(output_dir() / "cpd_time_and_run_modes.png")
-    plt.show()
-    plt.close()
-
-
-def visualise_principle_components_feature_space(feature_factor, im_shape):
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(1, 2, 1)
+    ax = fig.add_subplot(2, 3, 3)
     ax.imshow(feature_factor[:, 0].reshape(im_shape).T, cmap='gray')
-    ax.set_title("First mode")
     ax.axis('off')
-    ax = fig.add_subplot(1, 2, 2)
+
+    ax = fig.add_subplot(2, 3, 6)
     ax.imshow(feature_factor[:, 1].reshape(im_shape).T, cmap='gray')
-    ax.set_title("Second mode")
     ax.axis('off')
-    fig.suptitle("Principle modes of canonical polyadic decomposition in feature space")
-    fig.savefig(output_dir() / "cpd_feature_space_modes.png")
-    plt.show()
+    ax.set_xlabel("Feature (reshaped to image)")
+
+    fig.tight_layout()
+
+    (output_dir() / "tensors").mkdir(exist_ok=True, parents=True)
+    fig.savefig(output_dir() / "tensors" / f"{name}_time_and_run_modes.png")
+
     plt.close()
 
 
-def plot_trajectory(trajectory_matrix_1, trajectory_matrix_2, ignition_status):
+def plot_trajectory(trajectory_matrix_1, trajectory_matrix_2, ignition_status, name):
     t_vals = np.arange(trajectory_matrix_1.shape[1])
     num_runs = trajectory_matrix_1.shape[0]
 
@@ -95,7 +109,7 @@ def plot_trajectory(trajectory_matrix_1, trajectory_matrix_2, ignition_status):
     assert len(ignition_status) == num_runs
 
     fig, axs = plt.subplots(1, 2, figsize=(12, 6))
-    fig.suptitle(f"CPD trajectory plot")
+    fig.suptitle(f"{name} trajectory plot")
 
     ax = axs[0]
 
@@ -150,8 +164,7 @@ def plot_trajectory(trajectory_matrix_1, trajectory_matrix_2, ignition_status):
     fig.colorbar(sm, ax=ax, label="Time point")
 
     fig.tight_layout()
-    plt.show()
-    fig.savefig(output_dir() / "cpd_trajectory_plot.png")
+    fig.savefig(output_dir() / "tensors" / f"{name}_trajectory_plot.png")
     plt.close()
 
 
