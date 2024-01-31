@@ -8,45 +8,20 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from utils import load_cached_schlieren_images
-
-PREPROCESSED_IMAGE_DIR = Path('../../data/preprocessed')
+from src.utils.paths import output_dir
+from src.utils.utils import load_cached_schlieren_images
+from src.utils.data_processing import predict_ignition_using_final_frames
+from src.image_analysis.nonrigid_registration_within_trajectories import plot_registration_results
 
 
 def main():
     run_to_image = load_cached_schlieren_images()
     run_names = [k for k in run_to_image.keys()]
+    ignition_status = predict_ignition_using_final_frames(run_to_image)
+    run_to_ignition_status = {k: v for k, v in zip(run_names, ignition_status)}
 
-    print(f"Loaded {len(run_to_image)} runs, with shapes {[v.shape for v in run_to_image.values()]}")
-    print(f"Memory footprint of data = {sum([v.nbytes for v in run_to_image.values()]) / 1024 / 1024} MB")
-
-    # plot_PCA_final_frame(run_to_image)
-
-    # Next up: create ignition / non-ignition labels based on PCA and show images for first few PCs
-
-    im_shape = next(iter(run_to_image.values())).shape[1:]
-    pca = PCA(n_components=10)
-    X = np.stack([v[-1].flatten() for v in run_to_image.values()], axis=0)
-    X = StandardScaler().fit_transform(X)
-    pca.fit(X)
-
-    pca_2 = PCA(n_components=2)
-    X_2 = pca_2.fit_transform(X)
-
-    # Plot X_2
-    plt.figure()
-    plt.scatter(X_2[:, 0], X_2[:, 1])
-    plt.xlabel("PC1")
-    plt.ylabel("PC2")
-    plt.title("PCA of final frames")
-    plt.show()
-
-    # Classification of ignition / non-ignition using PCA1 threshold
-    pca_1_threshold = 50
-    ignition_indices = np.where(X_2[:, 0] > pca_1_threshold)[0]
-    iginition_runs = [run_names[i] for i in ignition_indices]
-    run_to_image_ignition = {k: v for k, v in run_to_image.items() if k in iginition_runs}
-    run_to_image_nonignition = {k: v for k, v in run_to_image.items() if k not in iginition_runs}
+    run_to_image_ignition = {k: v for k, v in run_to_image.items() if run_to_ignition_status[k]}
+    run_to_image_nonignition = {k: v for k, v in run_to_image.items() if not run_to_ignition_status[k]}
     assert len(run_to_image_ignition) == 7
 
 
@@ -58,72 +33,37 @@ def main():
     reference_im = final_frames[6]
 
     # Register all images to the first one
-    registered_final_frames = []
-    transforms = []
+    registration_results = []
     for im in final_frames:
-        print("Registering image")
-        registered_image, transform = register_image_pair(reference_im, im)
-        registered_final_frames.append(registered_image)
-        transforms.append(transform)
+        registration_results.append(register_image_pair(reference_im, im))
 
-    # Plot the registered images - first row is the original, second row is the registered, third row is the displacement field
-    fig, axs = plt.subplots(3, 7, sharey=True, sharex=True)
-    for i, ax in enumerate(axs[0, :].flat):
-        ax.imshow(final_frames[i])
-        ax.set_title(f"{[k for k in run_to_image_ignition][i]}")
-    for i, ax in enumerate(axs[1, :].flat):
-        ax.imshow(registered_final_frames[i])
-    for i, ax in enumerate(axs[2, :].flat):
-        det = get_deformation_jacobian_det(final_frames[i], transforms[i])
-        ax.imshow(det, cmap='jet')
+    plot_registration_results(final_frames, registration_results, "Ignition final frames", ncols=7)
 
-    axs[0, 0].set_ylabel(f"Original images")
-    axs[1, 0].set_ylabel(f"Registered images")
-    axs[2, 0].set_ylabel(f"Determinant of Jacobian of displacement field")
-    fig.tight_layout()
+    # Compute PCA of originals
+    X = np.stack([v.flatten() for v in final_frames], axis=0)
+    X = StandardScaler().fit_transform(X)
+    pca = PCA(n_components=2)
+    X = pca.fit_transform(X)
+
+    # Compute PCA of registered images
+    X_r = np.stack([v[0].flatten() for v in registration_results], axis=0)
+    X_r = StandardScaler().fit_transform(X_r)
+    pca_r = PCA(n_components=2)
+    X_r = pca_r.fit_transform(X_r)
+
+    # Now plot the PCA of the original and registered images
+    fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+    axs[0].scatter(X[:, 0], X[:, 1])
+    axs[0].set_title("PCA of original final frames")
+    axs[0].set_xlabel("PC1")
+    axs[0].set_ylabel("PC2")
+    axs[1].scatter(X_r[:, 0], X_r[:, 1])
+    axs[1].set_title("PCA of registered final frames")
+    axs[1].set_xlabel("PC1")
+    axs[1].set_ylabel("PC2")
+    fig.savefig(output_dir() / "pca_original_vs_registered.png")
     plt.show()
 
-    # Now look at the PCA of the registered images compared to the originals
-    X_registered = np.stack([v.flatten() for v in registered_final_frames], axis=0)
-    X_registered = StandardScaler().fit_transform(X_registered)
-    X_registered_2 = pca_2.transform(X_registered)
-
-    # Plot X_2
-    plt.figure()
-    plt.scatter(X_2[:, 0], X_2[:, 1], label="Original")
-    plt.scatter(X_registered_2[:, 0], X_registered_2[:, 1], label="Registered")
-    plt.xlabel("PC1")
-    plt.ylabel("PC2")
-    plt.title("PCA of final frames")
-    plt.legend()
-    plt.show()
-
-    # Try combining the registered images with the non-ignition images, and add a gaussian blur filtering
-    final_frames_nonignition = [filters.gaussian(v[-1], sigma=10) for v in run_to_image_nonignition.values()]
-    registered_frames_ignition = [filters.gaussian(v, sigma=10) for v in registered_final_frames]
-    combined_final_frames = final_frames_nonignition + registered_frames_ignition
-    X_combined = np.stack([v.flatten() for v in combined_final_frames], axis=0)
-    X_combined = StandardScaler().fit_transform(X_combined)
-    pca_combined = PCA(n_components=2)
-    X_combined_2 = pca_combined.fit_transform(X_combined)
-
-    # Plot X_2
-    plt.figure()
-    plt.scatter(X_combined_2[:, 0], X_combined_2[:, 1])
-    plt.xlabel("PC1")
-    plt.ylabel("PC2")
-    plt.title("PCA of final frames")
-    plt.show()
-
-
-
-    
-
-
-
-
-    # Option: try out nonrigid registration of final frames before PCA
-    # Set up data for DMD
 
 
 def plot_principal_components(im_shape, pca):
@@ -185,7 +125,7 @@ def register_image_pair(fixed_im, moving_im):
     registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
 
     registration_method.SetInterpolator(sitk.sitkLinear)
-    registration_method.SetOptimizerAsLBFGS2(solutionAccuracy=1e-3, numberOfIterations=200, deltaConvergenceTolerance=0.01)
+    registration_method.SetOptimizerAsLBFGS2(numberOfIterations=200, deltaConvergenceTolerance=0.01)
 
     final_transformation = registration_method.Execute(fixed_image, moving_image)
 
