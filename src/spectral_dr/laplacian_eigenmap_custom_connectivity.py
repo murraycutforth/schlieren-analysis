@@ -11,20 +11,28 @@ from src.utils.data_processing import predict_ignition_using_final_frames
 
 def main():
     run_to_image = load_cached_schlieren_images()
+
+    # Concatenate all runs to 18 frames
+    for k, v in run_to_image.items():
+        run_to_image[k] = v[:18]
+
     seq_lens = [len(v) for v in run_to_image.values()]
 
     X, y = dataset_preparation(run_to_image)
 
-    A_traj = construct_connectivity_matrix_trajectories_only(X, seq_lens)
 
     # TODO: also adjust gamma and # of neighbours for default approach
 
     se_approaches = \
-        {"Euclidean": SpectralEmbedding(n_components=2, affinity='nearest_neighbors', random_state=0),
-         "Trajectory adjacency": SpectralEmbedding(n_components=2, affinity='precomputed', random_state=0),
-         }
+        {
+        "Time step adjacency": SpectralEmbedding(n_components=2, affinity='precomputed', random_state=0),
+        "RBF": SpectralEmbedding(n_components=2, affinity='nearest_neighbors', random_state=0),
+        "First frame adjacency": SpectralEmbedding(n_components=2, affinity='precomputed', random_state=0),
+        }
 
-    fit_targets = [X, A_traj]
+    A_first = construct_connectivity_matrix_first(X, seq_lens)
+    A_tstep = construct_connectivity_matrix_tsteps(X, seq_lens)
+    fit_targets = [A_tstep, X, A_first]
 
     evaluate_se_approaches(se_approaches, fit_targets, X, y, seq_lens)
 
@@ -79,7 +87,46 @@ def evaluate_se_approaches(se_approaches, fit_targets, X, y, seq_lens):
         plt.close(fig)
 
 
-def construct_connectivity_matrix_trajectories_only(X, seq_lens):
+def construct_connectivity_matrix_tsteps(X, seq_lens):
+    assert len(X) == sum(seq_lens)
+    for l in seq_lens:
+        assert l == 18
+
+    start_inds = np.cumsum([0] + seq_lens[:-1])
+
+    assert np.all(start_inds < len(X))
+
+    A = np.zeros((len(X), len(X)))
+
+    # Connect all start inds together
+    for i, j in itertools.product(start_inds, start_inds):
+        A[i, j] = 1
+        A[j, i] = 1
+
+    # For each run, connect adjacent frames together
+    for start_ind, seq_len in zip(start_inds, seq_lens):
+        for i in range(seq_len - 1):
+            A[start_ind + i, start_ind + i + 1] = 1
+            A[start_ind + i + 1, start_ind + i] = 1
+
+    # For each run, connect to same time step in other runs
+    for start_ind in start_inds:
+        for i in range(18):
+            for j in range(len(seq_lens)):
+                A[start_ind + i, j * 18 + i] = 1
+                A[j * 18 + i, start_ind + i] = 1
+
+    # Multiply by heat kernel NN matrix
+    se = SpectralEmbedding(n_components=2, affinity='nearest_neighbors', random_state=0)
+    se.fit(X)
+    A_euc = np.asarray(se.affinity_matrix_.todense())
+    A = A * A_euc + 0.1 * A  # Add small multiple of A to avoid disconnected components
+
+    return A
+
+
+
+def construct_connectivity_matrix_first(X, seq_lens):
     assert len(X) == sum(seq_lens)
 
     start_inds = np.cumsum([0] + seq_lens[:-1])
